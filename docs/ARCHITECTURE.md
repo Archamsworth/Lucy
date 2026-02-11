@@ -473,7 +473,7 @@ Final prompt sent to LLM:
 - **Qwen2.5:** https://github.com/QwenLM/Qwen2.5
 - **llama.cpp:** https://github.com/ggerganov/llama.cpp
 - **VRM:** https://vrm.dev/
-- **FastAPI:** https://fastapi.tianglio.com/
+- **FastAPI:** https://fastapi.tiangolo.com/
 - **Whisper:** https://github.com/openai/whisper
 - **Unity:** https://unity.com/
 
