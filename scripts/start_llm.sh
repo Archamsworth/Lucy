@@ -19,7 +19,7 @@ if [ ! -f "$MODEL_PATH" ]; then
 fi
 
 # Check if llama.cpp server exists
-if [ ! -f "./llama.cpp/server" ] && [ ! -f "./server" ]; then
+if [ ! -f "./llama.cpp/server" ] && [ ! -f "./server" ] && [ ! -f "./llama.cpp/build/bin/server" ]; then
     echo "❌ Error: llama.cpp server not found"
     echo "Please build llama.cpp first:"
     echo "  git clone https://github.com/ggerganov/llama.cpp"
@@ -29,10 +29,13 @@ fi
 
 # Find server binary
 SERVER_BIN=""
-if [ -f "./llama.cpp/server" ]; then
+if [ -f "./llama.cpp/build/bin/server" ]; then
+    SERVER_BIN="./llama.cpp/build/bin/server"
+elif [ -f "./llama.cpp/server" ]; then
     SERVER_BIN="./llama.cpp/server"
 elif [ -f "./server" ]; then
-    SERVER_BIN="./server"i
+    SERVER_BIN="./server"
+fi
 
 echo "Model: $MODEL_PATH"
 echo "Context: $CONTEXT_SIZE"

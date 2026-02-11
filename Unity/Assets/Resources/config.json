@@ -1,0 +1,8 @@
+{
+  "backendURL": "http://localhost:8000",
+  "micSampleRate": 16000,
+  "maxRecordingLength": 30,
+  "idleAnimationInterval": 3.0,
+  "expressionDuration": 2.0,
+  "expressionTransitionSpeed": 5.0
+}
