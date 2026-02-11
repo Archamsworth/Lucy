@@ -6,17 +6,46 @@ Handles LLM inference, STT, TTS, and expression parsing
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
-import requests
-import re
-import json
 from pathlib import Path
-import tempfile
-import os
 from typing import List, Optional
+import traceback
 
-app = FastAPI(title="Lucy AI Companion API")
+# Import modular components
+from config import (
+    LLAMA_CPP_URL, MAX_CONVERSATION_HISTORY, SYSTEM_PROMPT,
+    AUDIO_OUTPUT_DIR, WHISPER_MODEL_SIZE, WHISPER_DEVICE,
+    WHISPER_COMPUTE_TYPE, TTS_ENGINE, TTS_VOICE
+)
+from llm_client import LLMClient, LLMConfig
+from conversation_manager import ConversationManager
+from expression_parser import ExpressionParser
+from input_processor import InputProcessor
+from tts_handler import TTSHandler
+
+# Optional imports for STT/TTS
+try:
+    from stt_whisper import WhisperSTT
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("Warning: faster-whisper not installed. STT will be unavailable.")
+
+try:
+    from tts_engine import TTSEngine
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    print("Warning: TTS engine not available. Audio responses will be disabled.")
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Lucy AI Companion API",
+    description="Real-time virtual companion with emotion-aware responses",
+    version="1.0.0"
+)
 
 # CORS middleware for Unity integration
 app.add_middleware(
@@ -27,33 +56,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-LLAMA_CPP_URL = "http://localhost:8001/v1/chat/completions"
-MAX_HISTORY = 6  # Keep last 6 conversation exchanges
+# Mount static files for audio serving
+AUDIO_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+app.mount("/audio", StaticFiles(directory=str(AUDIO_OUTPUT_DIR)), name="audio")
 
-# System prompt with expression tagging
-SYSTEM_PROMPT = """You are Lucy, a virtual companion.
-You speak naturally and emotionally.
+# Initialize components
+llm_client = LLMClient(LLMConfig(url=LLAMA_CPP_URL))
+conversation_manager = ConversationManager(max_history=MAX_CONVERSATION_HISTORY)
+expression_parser = ExpressionParser()
 
-Rules:
-- Always express emotions using captions like:
-  *smile*
-  *smirk*
-  *pout*
-  *giggle*
-  *blush*
-  *shy*
-  *angry*
-  *excited*
-- Put expression captions on separate lines.
-- Do NOT describe emotions in plain text.
-- Keep responses short and conversational.
-- Speak like a real human in real-time chat.
-- Be warm, friendly, and engaging.
-"""
+# Initialize STT if available
+stt_engine = None
+if WHISPER_AVAILABLE:
+    try:
+        stt_engine = WhisperSTT(
+            model_size=WHISPER_MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE
+        )
+        print(f"✓ Whisper STT initialized ({WHISPER_MODEL_SIZE})")
+    except Exception as e:
+        print(f"Warning: Could not initialize Whisper: {e}")
 
-# Conversation memory (in production, use Redis or database)
-conversation_history = {}
+input_processor = InputProcessor(stt_engine=stt_engine)
+
+# Initialize TTS if available
+tts_handler = None
+if TTS_AVAILABLE:
+    try:
+        tts_engine = TTSEngine(engine=TTS_ENGINE, voice=TTS_VOICE)
+        tts_handler = TTSHandler(tts_engine, output_dir=str(AUDIO_OUTPUT_DIR))
+        print(f"✓ TTS initialized ({TTS_ENGINE})")
+    except Exception as e:
+        print(f"Warning: Could not initialize TTS: {e}")
 
 
 class TextInput(BaseModel):
@@ -63,166 +98,166 @@ class TextInput(BaseModel):
     max_tokens: int = 200
 
 
+class SpeechInput(BaseModel):
+    user_id: str = "default"
+    temperature: float = 0.8
+    max_tokens: int = 200
+
+
 class ConversationResponse(BaseModel):
     expressions: List[str]
     text: str
-    audio_path: Optional[str] = None
+    audio_url: Optional[str] = None
     raw_response: str
-
-
-def parse_expression_output(text: str) -> tuple[List[str], str]:
-    """
-    Extract expressions and clean text from model output
-    
-    Example input:
-    *smirk*
-    Oh really? You think you can beat me?
-    *giggle*
-    That's cute.
-    
-    Returns: (['smirk', 'giggle'], "Oh really? You think you can beat me? That's cute.")
-    """
-    expressions = re.findall(r"\*(.*?)\*", text)
-    clean_text = re.sub(r"\*(.*?)\*", "", text).strip()
-    # Remove extra whitespace and newlines
-    clean_text = " ".join(clean_text.split())
-    return expressions, clean_text
-
-
-def get_conversation_history(user_id: str) -> List[dict]:
-    """Get conversation history for a user"""
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-    return conversation_history[user_id]
-
-
-def update_conversation_history(user_id: str, role: str, content: str):
-    """Update conversation history, maintaining max length"""
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-    
-    conversation_history[user_id].append({"role": role, "content": content})
-    
-    # Keep only last MAX_HISTORY exchanges (user + assistant pairs)
-    if len(conversation_history[user_id]) > MAX_HISTORY * 2:
-        conversation_history[user_id] = conversation_history[user_id][-(MAX_HISTORY * 2):]
-
-
-def query_llm(messages: List[dict], temperature: float = 0.8, max_tokens: int = 200) -> str:
-    """Query the llama.cpp server"""
-    try:
-        payload = {
-            "messages": messages,
-            "temperature": temperature,
-            "top_p": 0.9,
-            "max_tokens": max_tokens,
-            "repeat_penalty": 1.1,
-            "stream": False
-        }
-        
-        response = requests.post(LLAMA_CPP_URL, json=payload, timeout=30)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
-        
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"LLM service error: {str(e)}")
 
 
 @app.get("/")
 async def root():
-    return {"message": "Lucy AI Companion API", "status": "online"}
+    """Root endpoint with API information"""
+    return {
+        "message": "Lucy AI Companion API",
+        "status": "online",
+        "version": "1.0.0",
+        "features": {
+            "chat": True,
+            "stt": WHISPER_AVAILABLE,
+            "tts": TTS_AVAILABLE
+        }
+    }
 
 
 @app.get("/health")
 async def health_check():
     """Check if all services are running"""
-    try:
-        # Test llama.cpp connection
-        response = requests.get(f"http://localhost:8001/health", timeout=5)
-        llm_status = "online" if response.status_code == 200 else "offline"
-    except:
-        llm_status = "offline"
+    llm_healthy = llm_client.check_health()
     
     return {
         "api": "online",
-        "llm": llm_status
+        "llm": "online" if llm_healthy else "offline",
+        "stt": "available" if WHISPER_AVAILABLE else "unavailable",
+        "tts": "available" if TTS_AVAILABLE else "unavailable"
     }
 
 
 @app.post("/chat", response_model=ConversationResponse)
 async def chat(input_data: TextInput):
-    """Main chat endpoint
-    Handles text input and returns expressions + clean text"""
-    user_id = input_data.user_id
-    user_message = input_data.message
-    
-    # Get conversation history
-    history = get_conversation_history(user_id)
-    
-    # Build messages for LLM
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
-    
-    # Query LLM
-    response = query_llm(messages, input_data.temperature, input_data.max_tokens)
-    
-    # Parse expressions and clean text
-    expressions, clean_text = parse_expression_output(response)
-    
-    # Update conversation history
-    update_conversation_history(user_id, "user", user_message)
-    update_conversation_history(user_id, "assistant", response)
-    
-    return ConversationResponse(
-        expressions=expressions,
-        text=clean_text,
-        audio_path=None,  # TTS integration point
-        raw_response=response
-    )
-
-
-@app.post("/speech-to-text")
-async def speech_to_text(audio: UploadFile = File(...)):
-    """Convert speech to text using Whisper
-    TODO: Integrate faster-whisper
     """
-    # Placeholder for Whisper integration
-    return JSONResponse(
-        status_code=501,
-        content={"message": "STT integration pending - integrate faster-whisper here"}
-    )
-
-
-@app.post("/text-to-speech")
-async def text_to_speech(text: str):
-    """Convert text to speech
-    TODO: Integrate OpenVoice or Piper TTS
+    Main chat endpoint - handles text input
+    
+    Processes text input, generates response with expressions,
+    and optionally synthesizes audio
     """
-    # Placeholder for TTS integration
-    return JSONResponse(
-        status_code=501,
-        content={"message": "TTS integration pending - integrate OpenVoice/Piper here"}
-    )
+    try:
+        user_id = input_data.user_id
+        
+        # Process and validate input
+        user_message = input_processor.process_text(input_data.message)
+        
+        # Build messages for LLM
+        messages = conversation_manager.format_for_llm(
+            user_id, SYSTEM_PROMPT, user_message
+        )
+        
+        # Query LLM
+        response = llm_client.generate(
+            messages,
+            temperature=input_data.temperature,
+            max_tokens=input_data.max_tokens
+        )
+        
+        # Parse expressions and clean text
+        expressions, clean_text = expression_parser.parse(response)
+        
+        # Update conversation history
+        conversation_manager.add_message(user_id, "user", user_message)
+        conversation_manager.add_message(user_id, "assistant", response)
+        
+        # Synthesize audio if TTS is available
+        audio_url = None
+        if tts_handler and clean_text:
+            try:
+                audio_path = tts_handler.synthesize(clean_text, expressions)
+                # Convert to URL (assuming we're serving from /audio)
+                audio_url = f"/audio/{Path(audio_path).name}"
+            except Exception as e:
+                print(f"TTS warning: {e}")
+                # Continue without audio
+        
+        return ConversationResponse(
+            expressions=expressions,
+            text=clean_text,
+            audio_url=audio_url,
+            raw_response=response
+        )
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        print(f"Chat error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+
+@app.post("/speech", response_model=ConversationResponse)
+async def speech(
+    audio: UploadFile = File(...),
+    user_id: str = "default",
+    temperature: float = 0.8,
+    max_tokens: int = 200
+):
+    """
+    Speech input endpoint - handles audio input
+    
+    Transcribes speech to text, then processes like chat endpoint
+    """
+    if not WHISPER_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text not available. Install faster-whisper."
+        )
+    
+    try:
+        # Read audio file
+        audio_data = await audio.read()
+        
+        # Validate audio
+        input_processor.validate_audio(audio_data)
+        
+        # Transcribe speech to text
+        transcribed_text = input_processor.process_speech(
+            audio_data,
+            filename=audio.filename
+        )
+        
+        # Process as text input
+        input_data = TextInput(
+            user_id=user_id,
+            message=transcribed_text,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        return await chat(input_data)
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Speech error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.delete("/conversation/{user_id}")
 async def clear_conversation(user_id: str):
     """Clear conversation history for a user"""
-    if user_id in conversation_history:
-        conversation_history[user_id] = []
+    conversation_manager.clear_history(user_id)
     return {"message": f"Conversation history cleared for {user_id}"}
 
 
 @app.get("/conversation/{user_id}")
 async def get_conversation(user_id: str):
     """Get conversation history for a user"""
-    return {
-        "user_id": user_id,
-        "history": get_conversation_history(user_id)
-    }
+    return conversation_manager.export_history(user_id)
 
 
 if __name__ == "__main__":
