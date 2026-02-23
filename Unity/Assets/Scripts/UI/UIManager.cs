@@ -54,7 +54,14 @@ namespace Lucy
             {
                 micRecorder = gameObject.AddComponent<MicrophoneRecorder>();
             }
-            
+
+            // Wire up wake word listener if present on the same GameObject
+            WakeWordListener wakeListener = GetComponent<WakeWordListener>();
+            if (wakeListener != null)
+            {
+                wakeListener.OnWakeWordDetected += OnWakeWordDetected;
+            }
+
             // Subscribe to controller events
             if (controller != null)
             {
@@ -82,6 +89,12 @@ namespace Lucy
                 controller.OnResponseReceived -= OnResponseReceived;
                 controller.OnError -= OnError;
                 controller.OnStateChanged -= OnStateChanged;
+            }
+
+            WakeWordListener wakeListener = GetComponent<WakeWordListener>();
+            if (wakeListener != null)
+            {
+                wakeListener.OnWakeWordDetected -= OnWakeWordDetected;
             }
         }
         
@@ -256,6 +269,16 @@ namespace Lucy
             {
                 statusText.text = status;
             }
+        }
+
+        /// <summary>
+        /// Called by WakeWordListener when the wake phrase is detected.
+        /// Automatically starts microphone recording so the user can speak.
+        /// </summary>
+        private void OnWakeWordDetected()
+        {
+            UpdateStatusText("Wake word detected! Listening...");
+            StartRecording();
         }
     }
 }

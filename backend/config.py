@@ -37,6 +37,14 @@ BASE_DIR = Path(__file__).parent
 AUDIO_OUTPUT_DIR = BASE_DIR / "audio_output"
 AUDIO_OUTPUT_DIR.mkdir(exist_ok=True)
 
+# RAG Configuration
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
+RAG_MAX_RESULTS = int(os.getenv("RAG_MAX_RESULTS", "3"))
+RAG_SNIPPET_MAX_CHARS = int(os.getenv("RAG_SNIPPET_MAX_CHARS", "300"))
+
+# Wake Word Configuration
+WAKE_WORDS = [w.strip() for w in os.getenv("WAKE_WORDS", "hey lucy,hi lucy,ok lucy,okay lucy").split(",")]
+
 # System Prompt
 SYSTEM_PROMPT = """You are Lucy, a virtual companion.
 You speak naturally and emotionally.
