@@ -17,13 +17,17 @@ import traceback
 from config import (
     LLAMA_CPP_URL, MAX_CONVERSATION_HISTORY, SYSTEM_PROMPT,
     AUDIO_OUTPUT_DIR, WHISPER_MODEL_SIZE, WHISPER_DEVICE,
-    WHISPER_COMPUTE_TYPE, TTS_ENGINE, TTS_VOICE
+    WHISPER_COMPUTE_TYPE, TTS_ENGINE, TTS_VOICE,
+    RAG_ENABLED, RAG_MAX_RESULTS, RAG_SNIPPET_MAX_CHARS,
+    WAKE_WORDS
 )
 from llm_client import LLMClient, LLMConfig
 from conversation_manager import ConversationManager
 from expression_parser import ExpressionParser
 from input_processor import InputProcessor
 from tts_handler import TTSHandler
+from rag_web_search import WebRAG
+from wake_word import WakeWordDetector
 
 # Optional imports for STT/TTS
 try:
@@ -65,6 +69,13 @@ llm_client = LLMClient(LLMConfig(url=LLAMA_CPP_URL))
 conversation_manager = ConversationManager(max_history=MAX_CONVERSATION_HISTORY)
 expression_parser = ExpressionParser()
 
+# Initialize RAG
+rag = WebRAG(max_results=RAG_MAX_RESULTS, snippet_max_chars=RAG_SNIPPET_MAX_CHARS)
+if RAG_ENABLED and rag.is_available:
+    print("✓ Web RAG initialized (DuckDuckGo)")
+elif RAG_ENABLED:
+    print("Warning: RAG enabled but duckduckgo-search not installed. Install with: pip install duckduckgo-search")
+
 # Initialize STT if available
 stt_engine = None
 if WHISPER_AVAILABLE:
@@ -79,6 +90,10 @@ if WHISPER_AVAILABLE:
         print(f"Warning: Could not initialize Whisper: {e}")
 
 input_processor = InputProcessor(stt_engine=stt_engine)
+
+# Initialize wake word detector
+wake_word_detector = WakeWordDetector(wake_words=WAKE_WORDS, stt_engine=stt_engine)
+print(f"✓ Wake word detector initialized ({wake_word_detector.get_wake_words()})")
 
 # Initialize TTS if available
 tts_handler = None
@@ -121,7 +136,9 @@ async def root():
         "features": {
             "chat": True,
             "stt": WHISPER_AVAILABLE,
-            "tts": TTS_AVAILABLE
+            "tts": TTS_AVAILABLE,
+            "rag": RAG_ENABLED and rag.is_available,
+            "wake_word": True
         }
     }
 
@@ -130,12 +147,13 @@ async def root():
 async def health_check():
     """Check if all services are running"""
     llm_healthy = llm_client.check_health()
-    
+
     return {
         "api": "online",
         "llm": "online" if llm_healthy else "offline",
         "stt": "available" if WHISPER_AVAILABLE else "unavailable",
-        "tts": "available" if TTS_AVAILABLE else "unavailable"
+        "tts": "available" if TTS_AVAILABLE else "unavailable",
+        "rag": "available" if (RAG_ENABLED and rag.is_available) else "unavailable"
     }
 
 
@@ -149,13 +167,20 @@ async def chat(input_data: TextInput):
     """
     try:
         user_id = input_data.user_id
-        
+
         # Process and validate input
         user_message = input_processor.process_text(input_data.message)
-        
+
+        # Optionally augment system prompt with web search context
+        system_prompt = SYSTEM_PROMPT
+        if RAG_ENABLED and rag.is_available:
+            web_context = rag.augment_query(user_message)
+            if web_context:
+                system_prompt = f"{SYSTEM_PROMPT}\n\n{web_context}"
+
         # Build messages for LLM
         messages = conversation_manager.format_for_llm(
-            user_id, SYSTEM_PROMPT, user_message
+            user_id, system_prompt, user_message
         )
         
         # Query LLM
@@ -258,6 +283,95 @@ async def clear_conversation(user_id: str):
 async def get_conversation(user_id: str):
     """Get conversation history for a user"""
     return conversation_manager.export_history(user_id)
+
+
+class RAGSearchRequest(BaseModel):
+    query: str
+
+
+@app.post("/rag_search")
+async def rag_search(request: RAGSearchRequest):
+    """
+    Perform a web search and return formatted context for RAG
+
+    Returns the top search results as a context string that can be
+    used to augment an LLM prompt.
+    """
+    if not RAG_ENABLED or not rag.is_available:
+        raise HTTPException(
+            status_code=503,
+            detail="Web RAG is unavailable. Install duckduckgo-search or set RAG_ENABLED=true."
+        )
+
+    try:
+        query = request.query.strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="Query must not be empty")
+
+        results = rag.search(query)
+        context = rag.format_context(results)
+
+        return {
+            "query": query,
+            "results": [
+                {"title": r.title, "body": r.body, "href": r.href}
+                for r in results
+            ],
+            "context": context
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"RAG search error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+
+@app.post("/wake")
+async def detect_wake_word(
+    audio: UploadFile = File(...),
+):
+    """
+    Wake word detection endpoint
+
+    Accepts a short audio clip, transcribes it with Whisper, and returns
+    whether a wake word phrase (e.g. "hey lucy") was detected.
+    The Unity client polls this endpoint with short recorded chunks to
+    enable hands-free voice activation.
+    """
+    if not WHISPER_AVAILABLE or stt_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Wake word detection requires Whisper STT. Install faster-whisper."
+        )
+
+    try:
+        audio_data = await audio.read()
+        input_processor.validate_audio(audio_data)
+
+        transcribed = input_processor.process_speech(
+            audio_data,
+            filename=audio.filename
+        )
+
+        detected = wake_word_detector.detect(transcribed)
+
+        return {
+            "wake_word_detected": detected,
+            "transcription": transcribed,
+            "wake_words": wake_word_detector.get_wake_words()
+        }
+
+    except ValueError as e:
+        # Expected cases: no speech detected or audio too small – treat as no wake word
+        print(f"Wake word detection skipped (no speech): {e}")
+        return {
+            "wake_word_detected": False,
+            "transcription": "",
+            "wake_words": wake_word_detector.get_wake_words()
+        }
+    except Exception as e:
+        print(f"Wake word error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 if __name__ == "__main__":
